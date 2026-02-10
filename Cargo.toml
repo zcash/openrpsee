@@ -2,6 +2,7 @@
 name = "openrpsee"
 version = "0.1.0"
 edition = "2024"
+description = "Library for building OpenRPC documents"
 
 [dependencies]
 
