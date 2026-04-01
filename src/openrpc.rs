@@ -3,8 +3,7 @@
 use std::borrow::Cow;
 
 use documented::Documented;
-use jsonrpsee::core::{JsonValue, RpcResult};
-use std::borrow::Cow;
+use jsonrpsee::core::RpcResult;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator, generate::SchemaSettings};
 use serde::Serialize;
