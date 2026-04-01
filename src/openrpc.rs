@@ -3,7 +3,8 @@
 use std::borrow::Cow;
 
 use documented::Documented;
-use jsonrpsee::core::{JsonValue, RpcResult};
+use jsonrpsee::core::RpcResult;
+
 use schemars::{JsonSchema, Schema, SchemaGenerator, generate::SchemaSettings};
 use serde::Serialize;
 
@@ -27,6 +28,16 @@ pub struct RpcMethod {
 impl RpcMethod {
     /// Generates the OpenRPC method descriptor.
     pub fn generate(&self, generator: &mut Generator, name: &'static str) -> Method {
+        self.generate_with_tag(generator, name, None)
+    }
+
+    /// Generates the OpenRPC method descriptor with an optional tag.
+    pub fn generate_with_tag(
+        &self,
+        generator: &mut Generator,
+        name: &'static str,
+        tag: Option<&str>,
+    ) -> Method {
         let description = self.description.trim();
 
         Method {
@@ -39,6 +50,13 @@ impl RpcMethod {
             params: (self.params)(generator),
             result: (self.result)(generator),
             deprecated: self.deprecated,
+            tags: tag
+                .map(|t| {
+                    vec![Tag {
+                        name: t.to_string(),
+                    }]
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -95,10 +113,32 @@ impl Generator {
         }
     }
 
+    /// Constructs the descriptor for a JSON-RPC method's result type.
+    ///
+    /// Unlike [`result`](Self::result), this method does not require `T` to implement
+    /// `Documented`, accepting a description parameter directly instead.
+    pub fn result_schema<T: JsonSchema>(
+        &mut self,
+        name: &'static str,
+        description: &'static str,
+    ) -> ContentDescriptor {
+        ContentDescriptor {
+            name,
+            summary: description
+                .split_once('\n')
+                .map(|(summary, _)| summary)
+                .unwrap_or(description),
+            description,
+            required: false,
+            schema: self.inner.subschema_for::<T>(),
+            deprecated: false,
+        }
+    }
+
     /// Consumes the generator and produces the OpenRPC components.
     pub fn into_components(mut self) -> Components {
         Components {
-            schemas: self.inner.take_definitions(false),
+            schemas: self.inner.take_definitions(true),
         }
     }
 }
@@ -149,6 +189,14 @@ pub struct Method {
     result: ContentDescriptor,
     #[serde(skip_serializing_if = "is_false")]
     deprecated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<Tag>,
+}
+
+/// A tag for a JSON-RPC method.
+#[derive(Clone, Debug, Serialize)]
+pub struct Tag {
+    name: String,
 }
 
 /// A descriptor for a JSON-RPC method's parameter or result.
@@ -167,7 +215,7 @@ pub struct ContentDescriptor {
 /// The components (schemas) used in the OpenRPC document.
 #[derive(Clone, Debug, Serialize)]
 pub struct Components {
-    schemas: serde_json::Map<String, JsonValue>,
+    schemas: serde_json::Map<String, serde_json::Value>,
 }
 
 fn is_false(b: &bool) -> bool {

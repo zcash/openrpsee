@@ -73,6 +73,30 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
                 .ident
                 .to_string();
 
+                // Extract the success type T from Result<T, E>.
+                let result_type = match &method.sig.output {
+                    syn::ReturnType::Type(_, ret) => match ret.as_ref() {
+                        syn::Type::Path(type_path) => {
+                            type_path.path.segments.first().and_then(|segment| {
+                                if segment.ident == "Result" {
+                                    if let syn::PathArguments::AngleBracketed(args) =
+                                        &segment.arguments
+                                    {
+                                        if let Some(syn::GenericArgument::Type(ty)) =
+                                            args.args.first()
+                                        {
+                                            return Some(ty.to_token_stream().to_string());
+                                        }
+                                    }
+                                }
+                                None
+                            })
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+
                 let params = method.sig.inputs.iter().filter_map(|arg| match arg {
                     syn::FnArg::Receiver(_) => None,
                     syn::FnArg::Typed(pat_type) => match pat_type.pat.as_ref() {
@@ -186,10 +210,14 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
                 }
                 contents.push_str("    ],\n");
 
-                contents.push_str("    result: |g| g.result::<openrpsee::openrpc");
-                contents.push_str("::ResultType>(\"");
+                let result_ty = result_type
+                    .as_deref()
+                    .unwrap_or("()");
+                contents.push_str("    result: |g| g.result_schema::<");
+                contents.push_str(result_ty);
+                contents.push_str(">(\"");
                 contents.push_str(&command);
-                contents.push_str("_result\"),\n");
+                contents.push_str("_result\", \"\"),\n");
 
                 contents.push_str("    deprecated: ");
                 contents.push_str(
@@ -212,4 +240,52 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     fs::write(&rpc_openrpc_path, contents)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_result_type_extraction() {
+        let test_rs = r#"
+trait TestRpc {
+    /// Get something cool
+    #[method(name = "get_something")]
+    async fn get_something(&self, params: MyParams) -> Result<MyResponse, ErrorObjectOwned>;
+
+    /// Do action with no return
+    #[method(name = "do_action")]
+    async fn do_action(&self, params: MyParams) -> Result<(), ErrorObjectOwned>;
+}
+"#;
+        let tmp = std::env::temp_dir().join("openrpsee_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let test_file = tmp.join("test_rpc.rs");
+        std::fs::write(&test_file, test_rs).unwrap();
+        let out = tmp.join("output");
+        std::fs::create_dir_all(&out).unwrap();
+
+        generate_openrpc(test_file.to_str().unwrap(), &["TestRpc"], false, &out).unwrap();
+
+        let generated = std::fs::read_to_string(out.join("rpc_openrpc.rs")).unwrap();
+        println!("{}", generated);
+
+        assert!(
+            generated.contains("result_schema::<MyResponse>"),
+            "Should use MyResponse as result type, got:\n{}",
+            generated
+        );
+        assert!(
+            generated.contains("result_schema::<()>"),
+            "Should use () as result type, got:\n{}",
+            generated
+        );
+        assert!(
+            !generated.contains("::ResultType"),
+            "Should NOT use hardcoded ResultType, got:\n{}",
+            generated
+        );
+    }
 }
