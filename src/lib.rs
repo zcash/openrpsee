@@ -20,6 +20,38 @@ pub fn generate_openrpc(
     use_parent_module: bool,
     out_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
+    generate(
+        json_rpc_methods_rs,
+        trait_names,
+        use_parent_module,
+        false,
+        out_dir,
+    )
+}
+
+/// Like [`generate_openrpc`] without `use_parent_module`, but takes each parameter's description,
+/// `default` and `example` from a `# Parameters` section in the method's doc comment instead of
+/// `PARAM_*` constants, and leaves that section out of the method description.
+///
+/// Each parameter needs a line like
+/// ``- `verbosity`: (number, optional, default=1, example=1) 0 for hex, 1 for a JSON object.``.
+/// `required` or `optional` must match the Rust type. Every problem in every method is returned
+/// in one error.
+pub fn generate_openrpc_with_doc_params(
+    json_rpc_methods_rs: &str,
+    trait_names: &[&str],
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    generate(json_rpc_methods_rs, trait_names, false, true, out_dir)
+}
+
+fn generate(
+    json_rpc_methods_rs: &str,
+    trait_names: &[&str],
+    use_parent_module: bool,
+    doc_params: bool,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
     // Parse the source file containing the requested traits.
     let methods_rs = fs::read_to_string(json_rpc_methods_rs)?;
     let methods_ast = syn::parse_file(&methods_rs)?;
@@ -50,6 +82,7 @@ phf::phf_map! {
 "
     .to_string();
 
+    let mut errors = vec![];
     for item in traits.iter().flat_map(|tr| tr.items.iter()) {
         if let syn::TraitItem::Fn(method) = item {
             // Find methods via their `#[method(name = "command")]` attribute.
@@ -78,62 +111,66 @@ phf::phf_map! {
                 .ident
                 .to_string();
 
-                let params = method.sig.inputs.iter().filter_map(|arg| match arg {
-                    syn::FnArg::Receiver(_) => None,
-                    syn::FnArg::Typed(pat_type) => match pat_type.pat.as_ref() {
-                        syn::Pat::Ident(pat_ident) => {
-                            let parameter = pat_ident.ident.to_string();
-                            let rust_ty = pat_type.ty.as_ref();
+                let params: Vec<_> = method
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        syn::FnArg::Receiver(_) => None,
+                        syn::FnArg::Typed(pat_type) => match pat_type.pat.as_ref() {
+                            syn::Pat::Ident(pat_ident) => {
+                                let parameter = pat_ident.ident.to_string();
+                                let rust_ty = pat_type.ty.as_ref();
 
-                            // If we can determine the parameter's optionality, do so.
-                            let (param_ty, required) = match rust_ty {
-                                syn::Type::Path(type_path) => {
-                                    let is_standalone_ident =
-                                        type_path.path.leading_colon.is_none()
-                                            && type_path.path.segments.len() == 1;
-                                    let first_segment = &type_path.path.segments[0];
+                                // If we can determine the parameter's optionality, do so.
+                                let (param_ty, required) = match rust_ty {
+                                    syn::Type::Path(type_path) => {
+                                        let is_standalone_ident =
+                                            type_path.path.leading_colon.is_none()
+                                                && type_path.path.segments.len() == 1;
+                                        let first_segment = &type_path.path.segments[0];
 
-                                    if first_segment.ident == "Option" && is_standalone_ident {
-                                        // Strip the `Option<_>` for the schema type.
-                                        let schema_ty = match &first_segment.arguments {
-                                            syn::PathArguments::AngleBracketed(args) => {
-                                                match args.args.first().expect("valid Option") {
-                                                    syn::GenericArgument::Type(ty) => ty,
-                                                    _ => panic!("Invalid Option"),
+                                        if first_segment.ident == "Option" && is_standalone_ident {
+                                            // Strip the `Option<_>` for the schema type.
+                                            let schema_ty = match &first_segment.arguments {
+                                                syn::PathArguments::AngleBracketed(args) => {
+                                                    match args.args.first().expect("valid Option") {
+                                                        syn::GenericArgument::Type(ty) => ty,
+                                                        _ => panic!("Invalid Option"),
+                                                    }
                                                 }
-                                            }
-                                            _ => panic!("Invalid Option"),
-                                        };
-                                        (schema_ty, Some(false))
-                                    } else if first_segment.ident == "Vec" {
-                                        // We don't know whether the vec may be empty.
-                                        (rust_ty, None)
-                                    } else {
-                                        (rust_ty, Some(true))
+                                                _ => panic!("Invalid Option"),
+                                            };
+                                            (schema_ty, Some(false))
+                                        } else if first_segment.ident == "Vec" {
+                                            // We don't know whether the vec may be empty.
+                                            (rust_ty, None)
+                                        } else {
+                                            (rust_ty, Some(true))
+                                        }
                                     }
-                                }
-                                _ => (rust_ty, Some(true)),
-                            };
+                                    _ => (rust_ty, Some(true)),
+                                };
 
-                            // Handle a few conversions we know we need.
-                            let param_ty = param_ty.to_token_stream().to_string();
-                            let schema_ty = match param_ty.as_str() {
-                                "age :: secrecy :: SecretString" => "String".into(),
-                                _ => param_ty,
-                            };
+                                // Handle a few conversions we know we need.
+                                let param_ty = param_ty.to_token_stream().to_string();
+                                let schema_ty = match param_ty.as_str() {
+                                    "age :: secrecy :: SecretString" => "String".into(),
+                                    _ => param_ty,
+                                };
 
-                            Some((parameter, schema_ty, required))
-                        }
-                        _ => None,
-                    },
-                });
+                                Some((parameter, schema_ty, required))
+                            }
+                            _ => None,
+                        },
+                    })
+                    .collect();
 
                 contents.push('"');
                 contents.push_str(&command);
                 contents.push_str("\" => ::openrpsee::openrpc::RpcMethod {\n");
 
-                let mut tags = vec![];
-                contents.push_str("    description: \"");
+                let mut doc_lines = vec![];
                 for attr in method
                     .attrs
                     .iter()
@@ -145,27 +182,36 @@ phf::phf_map! {
                     {
                         // Trim the leading space from the doc comment line.
                         let line = s.value();
-                        let trimmed_line = if line.is_empty() { &line } else { &line[1..] };
-
-                        // A `tags: a, b` line becomes the method's OpenRPC tags.
-                        if let Some(line_tags) = trimmed_line.strip_prefix("tags:") {
-                            tags.extend(
-                                line_tags
-                                    .split(',')
-                                    .map(str::trim)
-                                    .filter(|tag| !tag.is_empty())
-                                    .map(str::to_string),
-                            );
-                            continue;
-                        }
-
-                        let escaped = strip_intra_doc_links(trimmed_line)
-                            .escape_default()
-                            .collect::<String>();
-
-                        contents.push_str(&escaped);
-                        contents.push_str("\\n");
+                        doc_lines.push(if line.is_empty() {
+                            line
+                        } else {
+                            line[1..].to_string()
+                        });
                     }
+                }
+                let documented = doc_params.then(|| split_parameters_section(&mut doc_lines));
+
+                let mut tags = vec![];
+                contents.push_str("    description: \"");
+                for trimmed_line in &doc_lines {
+                    // A `tags: a, b` line becomes the method's OpenRPC tags.
+                    if let Some(line_tags) = trimmed_line.strip_prefix("tags:") {
+                        tags.extend(
+                            line_tags
+                                .split(',')
+                                .map(str::trim)
+                                .filter(|tag| !tag.is_empty())
+                                .map(str::to_string),
+                        );
+                        continue;
+                    }
+
+                    let escaped = strip_intra_doc_links(trimmed_line)
+                        .escape_default()
+                        .collect::<String>();
+
+                    contents.push_str(&escaped);
+                    contents.push_str("\\n");
                 }
                 contents.push_str("\",\n");
 
@@ -178,13 +224,22 @@ phf::phf_map! {
                 contents.push_str("],\n");
 
                 contents.push_str("    params: |_g| vec![\n");
-                for (parameter, schema_ty, required) in params {
+                if let Some(documented) = &documented {
+                    contents.push_str(&documented_params(
+                        &command,
+                        &params,
+                        documented,
+                        &mut errors,
+                    ));
+                }
+                for (parameter, schema_ty, required) in params.iter().filter(|_| !doc_params) {
+                    let required = *required;
                     let param_upper = parameter.to_uppercase();
 
                     contents.push_str("        _g.param::<");
-                    contents.push_str(&schema_ty);
+                    contents.push_str(schema_ty);
                     contents.push_str(">(\"");
-                    contents.push_str(&parameter);
+                    contents.push_str(parameter);
                     if use_parent_module {
                         contents.push_str("\", super::");
                         contents.push_str(&module);
@@ -235,6 +290,15 @@ phf::phf_map! {
                 contents.push_str("},\n");
             }
         }
+    }
+
+    if !errors.is_empty() {
+        return Err(format!(
+            "{} problems in `# Parameters` doc sections:\n  {}",
+            errors.len(),
+            errors.join("\n  ")
+        )
+        .into());
     }
 
     contents.push_str("}\n};");
@@ -345,6 +409,185 @@ fn is_intra_doc_link_text(text: &str) -> bool {
         && path
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+/// A parameter line from a method's `# Parameters` doc section.
+struct DocParam {
+    name: String,
+    annotation: Vec<String>,
+    description: String,
+}
+
+/// Removes the `# Parameters` section from `lines` and returns its parameter lines.
+///
+/// Indented and continuation lines are added to the parameter above them.
+fn split_parameters_section(lines: &mut Vec<String>) -> Vec<DocParam> {
+    let Some(start) = lines.iter().position(|line| line.trim() == "# Parameters") else {
+        return vec![];
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.starts_with("# "))
+        .map_or(lines.len(), |i| start + 1 + i);
+
+    let mut params: Vec<DocParam> = vec![];
+    for line in lines.drain(start..end).skip(1) {
+        if let Some((name, rest)) = line
+            .strip_prefix("- `")
+            .and_then(|rest| rest.split_once('`'))
+        {
+            let rest = rest.trim_start_matches(':').trim_start();
+            let (annotation, text) = match rest.strip_prefix('(').and_then(split_parenthesized) {
+                Some((inner, after)) => (split_top_level(inner), after.trim_start_matches(':')),
+                None => (vec![], rest),
+            };
+            params.push(DocParam {
+                name: name.to_string(),
+                annotation,
+                description: text.trim().to_string(),
+            });
+        } else if !line.trim().is_empty()
+            && let Some(param) = params.last_mut()
+        {
+            if !param.description.is_empty() {
+                param.description.push('\n');
+            }
+            param.description.push_str(line.trim_end());
+        }
+    }
+    params
+}
+
+/// Splits `text`, which follows an opening `(`, at its matching `)`.
+fn split_parenthesized(text: &str) -> Option<(&str, &str)> {
+    let mut depth = 0;
+    let mut quoted = false;
+    for (i, c) in text.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '(' | '[' | '{' if !quoted => depth += 1,
+            ')' if !quoted && depth == 0 => return Some((&text[..i], &text[i + 1..])),
+            ')' | ']' | '}' if !quoted => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Splits an annotation at the commas outside brackets and quotes.
+fn split_top_level(text: &str) -> Vec<String> {
+    let mut parts = vec![];
+    let (mut depth, mut quoted, mut start) = (0, false, 0);
+    for (i, c) in text.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '(' | '[' | '{' if !quoted => depth += 1,
+            ')' | ']' | '}' if !quoted => depth -= 1,
+            ',' if !quoted && depth == 0 => {
+                parts.push(text[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(text[start..].trim().to_string());
+    parts
+}
+
+/// Returns `value` as JSON text: as written when it is JSON, otherwise as a string.
+fn json_text(value: &str) -> String {
+    let value = value.trim().replace("\\\"", "\"");
+    serde_json::from_str::<serde_json::Value>(&value)
+        .unwrap_or_else(|_| serde_json::Value::String(value.trim_matches('"').to_string()))
+        .to_string()
+}
+
+/// Returns the generated parameter descriptors for `command`, recording problems in `errors`.
+fn documented_params(
+    command: &str,
+    params: &[(String, String, Option<bool>)],
+    documented: &[DocParam],
+    errors: &mut Vec<String>,
+) -> String {
+    let word = |required: bool| if required { "required" } else { "optional" };
+    for doc in documented {
+        if !params
+            .iter()
+            .any(|(parameter, _, _)| *parameter == doc.name)
+        {
+            errors.push(format!(
+                "`{command}`: `{}` is documented but is not a parameter",
+                doc.name
+            ));
+        }
+    }
+
+    let mut code = String::new();
+    for (parameter, schema_ty, type_required) in params {
+        let Some(doc) = documented.iter().find(|doc| doc.name == *parameter) else {
+            errors.push(format!(
+                "`{command}`: `{parameter}` has no line in `# Parameters`"
+            ));
+            continue;
+        };
+
+        let (mut doc_required, mut default, mut examples) = (None, None, vec![]);
+        for token in &doc.annotation {
+            match token
+                .split_once('=')
+                .map(|(key, value)| (key.trim(), value))
+            {
+                Some(("default", value)) => default = Some(json_text(value)),
+                Some(("example", value)) => examples.push(json_text(value)),
+                _ if token == "required" => doc_required = Some(true),
+                _ if token == "optional" => doc_required = Some(false),
+                _ => {}
+            }
+        }
+        let required = match (*type_required, doc_required) {
+            (Some(by_type), Some(by_doc)) if by_type != by_doc => {
+                errors.push(format!(
+                    "`{command}`: `{parameter}` is documented as {} but its type makes it {}",
+                    word(by_doc),
+                    word(by_type)
+                ));
+                by_type
+            }
+            (Some(by_type), _) => by_type,
+            (None, Some(by_doc)) => by_doc,
+            (None, None) => {
+                errors.push(format!(
+                    "`{command}`: `{parameter}` needs `required` or `optional` in its annotation"
+                ));
+                true
+            }
+        };
+        if doc.description.is_empty() {
+            errors.push(format!("`{command}`: `{parameter}` has no description"));
+        }
+
+        let literal = |text: &str| format!("\"{}\"", text.escape_default());
+        let description = doc
+            .description
+            .lines()
+            .map(strip_intra_doc_links)
+            .collect::<Vec<_>>()
+            .join("\n");
+        code.push_str(&format!(
+            "        _g.param_documented::<{schema_ty}>({}, {}, {required}, {}, &[{}]),\n",
+            literal(parameter),
+            literal(&description),
+            default
+                .as_deref()
+                .map_or("None".to_string(), |d| format!("Some({})", literal(d))),
+            examples
+                .iter()
+                .map(|e| literal(e))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    code
 }
 
 #[cfg(test)]
@@ -478,5 +721,131 @@ trait Rpc {
         ] {
             assert_eq!(strip_intra_doc_links(line), expected, "{line}");
         }
+    }
+
+    /// Runs the doc-comment parameter generator on `source` and returns the generated file.
+    fn generate_with_docs(source: &str) -> Result<String, Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let methods_rs = dir.path().join("methods.rs");
+        fs::write(&methods_rs, source)?;
+        generate_openrpc_with_doc_params(
+            methods_rs.to_str().expect("utf-8 path"),
+            &["Rpc"],
+            dir.path(),
+        )?;
+        Ok(fs::read_to_string(dir.path().join("rpc_openrpc.rs"))?)
+    }
+
+    #[test]
+    fn parameters_come_from_the_doc_comment() {
+        let generated = generate_with_docs(
+            r#"
+trait Rpc {
+    /// Returns a block.
+    ///
+    /// # Parameters
+    ///
+    /// - `hash_or_height`: (string, required, example="1") The hash or height of the [`Block`].
+    /// - `verbosity`: (number, optional, default=1, example=1) 0 for hex,
+    ///   1 for a JSON object.
+    ///
+    /// # Notes
+    ///
+    /// Some notes.
+    #[method(name = "getblock")]
+    async fn get_block(&self, hash_or_height: String, verbosity: Option<u8>) -> Result<Block>;
+}
+"#,
+        )
+        .unwrap();
+
+        assert!(generated.contains(
+            r#"_g.param_documented::<String>("hash_or_height", "The hash or height of the `Block`.", true, None, &["\"1\""]),"#
+        ));
+        assert!(generated.contains(
+            r#"_g.param_documented::<u8>("verbosity", "0 for hex,\n  1 for a JSON object.", false, Some("1"), &["1"]),"#
+        ));
+        assert!(!generated.contains("# Parameters"), "{generated}");
+        assert!(generated.contains("# Notes"));
+        assert!(!generated.contains("PARAM_"));
+    }
+
+    #[test]
+    fn annotation_values_may_contain_commas() {
+        let generated = generate_with_docs(
+            r#"
+trait Rpc {
+    /// # Parameters
+    ///
+    /// - `request`: (object, required, example={"addresses": ["a", "b"]}) The request.
+    #[method(name = "getaddressbalance")]
+    async fn get_address_balance(&self, request: Request) -> Result<Balance>;
+}
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            generated.contains(r#"&["{\"addresses\":[\"a\",\"b\"]}"]"#),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn every_doc_problem_is_reported() {
+        let error = generate_with_docs(
+            r#"
+trait Rpc {
+    /// # Parameters
+    ///
+    /// - `verbose`: (bool, required) Whether to be verbose.
+    /// - `extra`: (string, required) Not a parameter.
+    #[method(name = "getrawtransaction")]
+    async fn get_raw_transaction(&self, txid: String, verbose: Option<u8>) -> Result<Tx>;
+
+    #[method(name = "getblockhash")]
+    async fn get_block_hash(&self, index: i32) -> Result<Hash>;
+
+    /// # Parameters
+    ///
+    /// - `hexdata`: (string, required)
+    #[method(name = "submitblock")]
+    async fn submit_block(&self, hexdata: String) -> Result<Submit>;
+}
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        for problem in [
+            "5 problems",
+            "`getrawtransaction`: `extra` is documented but is not a parameter",
+            "`getrawtransaction`: `txid` has no line in `# Parameters`",
+            "`getrawtransaction`: `verbose` is documented as required but its type makes it optional",
+            "`getblockhash`: `index` has no line in `# Parameters`",
+            "`submitblock`: `hexdata` has no description",
+        ] {
+            assert!(error.contains(problem), "missing {problem:?} in:\n{error}");
+        }
+    }
+
+    #[test]
+    fn constants_layout_keeps_the_parameters_section() {
+        let generated = generate(
+            r#"
+trait Rpc {
+    /// # Parameters
+    ///
+    /// - `index`: (number, required) The block index.
+    #[method(name = "getblockhash")]
+    async fn get_block_hash(&self, index: i32) -> Result<Hash>;
+}
+"#,
+            false,
+        )
+        .unwrap();
+
+        assert!(generated.contains("# Parameters"));
+        assert!(generated.contains("crate::methods::PARAM_INDEX_DESC"));
     }
 }

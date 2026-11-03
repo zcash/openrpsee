@@ -47,6 +47,23 @@ All RPC arguments are expected to be described using constants. These constants 
 
 - Zebra: https://github.com/ZcashFoundation/zebra/blob/14c6950a20cb9c0ced7a5b9455e411add4148884/zebra-rpc/src/methods.rs#L145-L173
 
+## Parameters From Doc Comments
+
+`generate_openrpc_with_doc_params` reads each parameter from a `# Parameters` section in the method's doc comment instead of `PARAM_*` constants, so the description stays next to the method:
+
+```rust
+/// Returns a block.
+///
+/// # Parameters
+///
+/// - `hash_or_height`: (string, required, example="1") The hash or height of the block.
+/// - `verbosity`: (number, optional, default=1) 0 for hex, 1 for a JSON object.
+#[method(name = "getblock")]
+async fn get_block(&self, hash_or_height: String, verbosity: Option<u8>) -> Result<Block>;
+```
+
+The text after the annotation becomes the parameter's description, and `default=` and `example=` become `default` and `examples` in its schema. `required` or `optional` must match the Rust type, and every parameter needs exactly one line. The build script reports every mismatch at once, and the section is left out of the method description.
+
 ## Result Types
 
 Each method's result schema comes from its return type, which must implement `schemars::JsonSchema`:
