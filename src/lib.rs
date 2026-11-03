@@ -9,6 +9,8 @@ use quote::ToTokens;
 
 pub mod openrpc;
 
+pub use phf;
+
 /// Generates a lookup table for the JSON-RPC methods defined in the given source file.
 ///
 /// This function is meant to be used in the build script (`build.rs`) of a project.
@@ -39,9 +41,12 @@ pub fn generate_openrpc(
         })
         .collect();
 
+    // `phf_map!` expands to a relative `phf::Map`, so bring the re-export into scope.
     let mut contents = "/// Lookup table for JSON-RPC methods.
 #[allow(unused_qualifications)]
-pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf_map! {
+pub(crate) static METHODS: ::openrpsee::phf::Map<&str, ::openrpsee::openrpc::RpcMethod> = {
+use ::openrpsee::phf;
+phf::phf_map! {
 "
     .to_string();
 
@@ -125,30 +130,52 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
 
                 contents.push('"');
                 contents.push_str(&command);
-                contents.push_str("\" => openrpsee::openrpc::RpcMethod {\n");
+                contents.push_str("\" => ::openrpsee::openrpc::RpcMethod {\n");
 
+                let mut tags = vec![];
                 contents.push_str("    description: \"");
                 for attr in method
                     .attrs
                     .iter()
                     .filter(|attr| attr.path().is_ident("doc"))
                 {
-                    if let syn::Meta::NameValue(doc_line) = &attr.meta {
-                        if let syn::Expr::Lit(docs) = &doc_line.value {
-                            if let syn::Lit::Str(s) = &docs.lit {
-                                // Trim the leading space from the doc comment line.
-                                let line = s.value();
-                                let trimmed_line = if line.is_empty() { &line } else { &line[1..] };
+                    if let syn::Meta::NameValue(doc_line) = &attr.meta
+                        && let syn::Expr::Lit(docs) = &doc_line.value
+                        && let syn::Lit::Str(s) = &docs.lit
+                    {
+                        // Trim the leading space from the doc comment line.
+                        let line = s.value();
+                        let trimmed_line = if line.is_empty() { &line } else { &line[1..] };
 
-                                let escaped = trimmed_line.escape_default().collect::<String>();
-
-                                contents.push_str(&escaped);
-                                contents.push_str("\\n");
-                            }
+                        // A `tags: a, b` line becomes the method's OpenRPC tags.
+                        if let Some(line_tags) = trimmed_line.strip_prefix("tags:") {
+                            tags.extend(
+                                line_tags
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|tag| !tag.is_empty())
+                                    .map(str::to_string),
+                            );
+                            continue;
                         }
+
+                        let escaped = strip_intra_doc_links(trimmed_line)
+                            .escape_default()
+                            .collect::<String>();
+
+                        contents.push_str(&escaped);
+                        contents.push_str("\\n");
                     }
                 }
                 contents.push_str("\",\n");
+
+                contents.push_str("    tags: &[");
+                for tag in &tags {
+                    contents.push('"');
+                    contents.push_str(&tag.escape_default().collect::<String>());
+                    contents.push_str("\", ");
+                }
+                contents.push_str("],\n");
 
                 contents.push_str("    params: |_g| vec![\n");
                 for (parameter, schema_ty, required) in params {
@@ -186,10 +213,14 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
                 }
                 contents.push_str("    ],\n");
 
-                contents.push_str("    result: |g| g.result::<openrpsee::openrpc");
-                contents.push_str("::ResultType>(\"");
-                contents.push_str(&command);
-                contents.push_str("_result\"),\n");
+                contents.push_str("    result: |g| ");
+                contents.push_str(&result_call(
+                    &method.sig.output,
+                    &module,
+                    use_parent_module,
+                    &command,
+                )?);
+                contents.push_str(",\n");
 
                 contents.push_str("    deprecated: ");
                 contents.push_str(
@@ -206,10 +237,246 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
         }
     }
 
-    contents.push_str("};");
+    contents.push_str("}\n};");
 
     let rpc_openrpc_path = out_dir.join("rpc_openrpc.rs");
     fs::write(&rpc_openrpc_path, contents)?;
 
     Ok(())
+}
+
+/// Returns the generated call that builds the result descriptor for `command`.
+///
+/// With `use_parent_module`, each method's module defines a `ResultType`. Otherwise the result
+/// is the `T` in a `Result<T, ..>` or `RpcResult<T>` return type, or the `ResultType` next to a
+/// `path::Response` return type.
+fn result_call(
+    output: &syn::ReturnType,
+    module: &str,
+    use_parent_module: bool,
+    command: &str,
+) -> Result<String, Box<dyn Error>> {
+    if use_parent_module {
+        return Ok(format!(
+            "g.result::<super::{module}::ResultType>(\"{command}_result\")"
+        ));
+    }
+
+    let path = match output {
+        syn::ReturnType::Type(_, ty) => match ty.as_ref() {
+            syn::Type::Path(type_path) => Some(&type_path.path),
+            _ => None,
+        },
+        syn::ReturnType::Default => None,
+    };
+    let last = path.and_then(|path| path.segments.last());
+
+    if let Some(last) = last {
+        if (last.ident == "Result" || last.ident == "RpcResult")
+            && let syn::PathArguments::AngleBracketed(args) = &last.arguments
+            && let Some(syn::GenericArgument::Type(ty)) = args.args.first()
+        {
+            let ty = ty.to_token_stream().to_string();
+            return Ok(format!(
+                "g.result_schema::<{ty}>(\"{command}_result\", \"\")"
+            ));
+        }
+
+        if last.ident == "Response" && last.arguments.is_empty() {
+            let mut path = path.expect("last segment exists").clone();
+            path.segments.last_mut().expect("last segment exists").ident =
+                syn::Ident::new("ResultType", last.ident.span());
+            let ty = path.to_token_stream().to_string();
+            return Ok(format!("g.result::<{ty}>(\"{command}_result\")"));
+        }
+    }
+
+    Err(format!(
+        "can't find the result type of `{command}`: return `Result<T, E>`, `RpcResult<T>` \
+         or a `Response` alias with a `ResultType` beside it"
+    )
+    .into())
+}
+
+/// Replaces rustdoc intra-doc links like ``[`Type`]`` with their text, because they only
+/// resolve inside rustdoc. Markdown links like ``[`name`](url)`` are kept.
+fn strip_intra_doc_links(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+
+    while let Some(start) = rest.find('[') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+
+        let Some(end) = after.find(']') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let text = &after[..end];
+        let tail = &after[end + 1..];
+
+        let is_markdown_link =
+            tail.starts_with('(') || tail.starts_with('[') || tail.starts_with(':');
+
+        let is_reference_label = start == 0 && out.ends_with(']');
+
+        if is_intra_doc_link_text(text) && !is_markdown_link && !is_reference_label {
+            out.push_str(text);
+        } else {
+            out.push('[');
+            out.push_str(text);
+            out.push(']');
+        }
+        rest = tail;
+    }
+
+    out.push_str(rest);
+    out
+}
+
+/// Returns true for the text of a rustdoc intra-doc link: a Rust path, optionally in backticks.
+fn is_intra_doc_link_text(text: &str) -> bool {
+    let path = text
+        .strip_prefix('`')
+        .and_then(|text| text.strip_suffix('`'))
+        .unwrap_or(text);
+
+    path.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs the generator on `source` and returns the generated file.
+    fn generate(source: &str, use_parent_module: bool) -> Result<String, Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let methods_rs = dir.path().join("methods.rs");
+        fs::write(&methods_rs, source)?;
+
+        generate_openrpc(
+            methods_rs.to_str().expect("utf-8 path"),
+            &["Rpc"],
+            use_parent_module,
+            dir.path(),
+        )?;
+
+        Ok(fs::read_to_string(dir.path().join("rpc_openrpc.rs"))?)
+    }
+
+    #[test]
+    fn result_type_comes_from_the_return_type() {
+        let generated = generate(
+            r#"
+trait Rpc {
+    #[method(name = "getinfo")]
+    async fn get_info(&self) -> Result<GetInfo>;
+    #[method(name = "stop")]
+    async fn stop(&self) -> jsonrpsee::core::RpcResult<()>;
+    #[method(name = "rpc.discover")]
+    fn openrpc(&self) -> openrpsee::openrpc::Response;
+}
+"#,
+            false,
+        )
+        .unwrap();
+
+        assert!(generated.contains(r#"g.result_schema::<GetInfo>("getinfo_result", "")"#));
+        assert!(generated.contains(r#"g.result_schema::<()>("stop_result", "")"#));
+        assert!(
+            generated.contains(
+                r#"g.result::<openrpsee :: openrpc :: ResultType>("rpc.discover_result")"#
+            )
+        );
+    }
+
+    #[test]
+    fn parent_module_result_type_is_unchanged() {
+        let generated = generate(
+            r#"
+trait Rpc {
+    #[method(name = "getwalletinfo")]
+    async fn get_wallet_info(&self) -> get_wallet_info::Response;
+}
+"#,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            generated.contains(
+                r#"g.result::<super::get_wallet_info::ResultType>("getwalletinfo_result")"#
+            )
+        );
+    }
+
+    #[test]
+    fn unknown_result_type_is_an_error() {
+        let error = generate(
+            r#"
+trait Rpc {
+    #[method(name = "getinfo")]
+    async fn get_info(&self) -> GetInfo;
+}
+"#,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("`getinfo`"), "{error}");
+    }
+
+    #[test]
+    fn tags_line_becomes_tags() {
+        let generated = generate(
+            r#"
+trait Rpc {
+    /// Returns software information.
+    ///
+    /// tags: control, network
+    #[method(name = "getinfo")]
+    async fn get_info(&self) -> Result<GetInfo>;
+}
+"#,
+            false,
+        )
+        .unwrap();
+
+        assert!(generated.contains(r#"tags: &["control", "network", ],"#));
+        assert!(!generated.contains("tags: control"));
+    }
+
+    #[test]
+    fn methods_table_does_not_need_phf() {
+        let generated = generate("trait Rpc {}", false).unwrap();
+
+        assert!(generated.contains("pub(crate) static METHODS: ::openrpsee::phf::Map"));
+        assert!(generated.contains("use ::openrpsee::phf;"));
+    }
+
+    #[test]
+    fn intra_doc_links_are_stripped() {
+        for (line, expected) in [
+            ("as a [`GetInfo`] JSON struct", "as a `GetInfo` JSON struct"),
+            ("see [crate::methods::Rpc]", "see crate::methods::Rpc"),
+            (
+                "[`getinfo`](https://zcash.github.io/rpc/getinfo.html)",
+                "[`getinfo`](https://zcash.github.io/rpc/getinfo.html)",
+            ),
+            (
+                "[the docs][docs] and [docs]: https://example.com",
+                "[the docs][docs] and [docs]: https://example.com",
+            ),
+            (r#"`["t1abc", "t1def"]`"#, r#"`["t1abc", "t1def"]`"#),
+            (
+                "a [1] footnote and an unclosed [",
+                "a [1] footnote and an unclosed [",
+            ),
+        ] {
+            assert_eq!(strip_intra_doc_links(line), expected, "{line}");
+        }
+    }
 }
