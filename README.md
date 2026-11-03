@@ -57,6 +57,8 @@ Each method's result schema comes from its return type, which must implement `sc
 
 Any other return type is a build script error.
 
+Results are described as they are serialized and parameters as they are deserialized, so a result field with `skip_serializing_if` is optional. A type used both ways must have the same schema in both; debug builds panic in `Generator::into_components` when it doesn't.
+
 ## Tags
 
 A `tags: a, b` line in a method's doc comment becomes the method's OpenRPC `tags`, and is left out of its description.
