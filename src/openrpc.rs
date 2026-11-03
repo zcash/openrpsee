@@ -93,6 +93,42 @@ impl Generator {
         }
     }
 
+    /// Constructs the descriptor for a JSON-RPC method parameter documented in the method's doc
+    /// comment, adding its `default` and `examples` to the schema.
+    ///
+    /// `default` and `examples` are JSON texts, checked by the build script.
+    pub fn param_documented<T: JsonSchema>(
+        &mut self,
+        name: &'static str,
+        description: &'static str,
+        required: bool,
+        default: Option<&'static str>,
+        examples: &'static [&'static str],
+    ) -> ContentDescriptor {
+        let mut descriptor = self.param::<T>(name, description, required);
+        if default.is_none() && examples.is_empty() {
+            return descriptor;
+        }
+
+        // Draft-07 ignores keywords next to a `$ref`, so wrap a reference.
+        let mut schema = descriptor.schema;
+        if schema.get("$ref").is_some() {
+            schema = schemars::json_schema!({ "allOf": [schema] });
+        }
+        let json = |text: &str| serde_json::from_str(text).expect("checked by the build script");
+        if let Some(default) = default {
+            schema.insert("default".into(), json(default));
+        }
+        if !examples.is_empty() {
+            schema.insert(
+                "examples".into(),
+                serde_json::Value::Array(examples.iter().map(|example| json(example)).collect()),
+            );
+        }
+        descriptor.schema = schema;
+        descriptor
+    }
+
     /// Constructs the descriptor for a JSON-RPC method's result type.
     pub fn result<T: Documented + JsonSchema>(&mut self, name: &'static str) -> ContentDescriptor {
         ContentDescriptor {
@@ -279,6 +315,26 @@ mod tests {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
         }));
         assert!(!schemas.contains("\"$ref\":\"http"), "{schemas}");
+    }
+
+    #[test]
+    fn documented_params_add_default_and_examples() {
+        let mut generator = Generator::new();
+        let plain = generator.param_documented::<u8>("verbosity", "", false, Some("1"), &["2"]);
+        let reference =
+            generator.param_documented::<Param>("request", "", true, None, &["{\"values\":[1]}"]);
+
+        let plain = serde_json::to_value(&plain.schema).unwrap();
+        assert_eq!(plain["default"], 1);
+        assert_eq!(plain["examples"], serde_json::json!([2]));
+
+        // A `$ref` is wrapped, because draft-07 ignores keywords next to it.
+        let reference = serde_json::to_value(&reference.schema).unwrap();
+        assert_eq!(reference["allOf"][0]["$ref"], "#/components/schemas/Param");
+        assert_eq!(
+            reference["examples"],
+            serde_json::json!([{ "values": [1] }])
+        );
     }
 
     #[test]
