@@ -18,51 +18,55 @@ Openrpsee provides utilities to:
 The `generate_openrpc` function parses the given RPC traits, extracts all method definitions, and builds a map containing the metadata required to generate an OpenRPC document.
 This map is then written as a Rust source file into the specified output directory.
 
-### Examples
+### Example
 
-- Zallet: https://github.com/zcash/wallet/blob/openrpsee/zallet/build.rs#L69
-- Zebra: https://github.com/ZcashFoundation/zebra/blob/openrpc/zebra-rpc/build.rs#L119
+- Zebra: https://github.com/ZcashFoundation/zebra/blob/14c6950a20cb9c0ced7a5b9455e411add4148884/zebra-rpc/build.rs#L171
 
 ## Including the Generated File
 
 The generated Rust file is intended to be included from your project’s `methods.rs` (or equivalent) module.
 
-### Examples:
+### Example
 
-- Zallet: https://github.com/zcash/wallet/blob/openrpsee/zallet/src/components/json_rpc/methods/openrpc.rs#L9
-- Zebra: https://github.com/ZcashFoundation/zebra/blob/openrpc/zebra-rpc/src/methods.rs#L138
+- Zebra: https://github.com/ZcashFoundation/zebra/blob/14c6950a20cb9c0ced7a5b9455e411add4148884/zebra-rpc/src/methods.rs#L141
 
 ## Generating the OpenRPC Document
 
 The `openrpc` module provided by this crate consumes the generated method map and produces an OpenRPC document.
 This document is typically returned by an implementation of the `rpc.discover` RPC method.
 
-### Examples:
+### Example
 
-- Zallet: https://github.com/zcash/wallet/blob/openrpsee/zallet/src/components/json_rpc/methods/openrpc.rs
-- Zebra: https://github.com/ZcashFoundation/zebra/blob/openrpc/zebra-rpc/src/methods.rs#L2983-L3002
+- Zebra: https://github.com/ZcashFoundation/zebra/blob/14c6950a20cb9c0ced7a5b9455e411add4148884/zebra-rpc/src/methods.rs#L3622-L3640
 
 ## Argument Documentation
 
 All RPC arguments are expected to be described using constants. These constants are used when generating the OpenRPC schema.
 
-Examples:
+### Example
 
-- Zallet: https://github.com/zcash/wallet/blob/openrpsee/zallet/src/components/json_rpc/methods/get_new_account.rs#L36-L37
-- Zebra: https://github.com/ZcashFoundation/zebra/blob/openrpc/zebra-rpc/src/methods.rs#L142-L167
+- Zebra: https://github.com/ZcashFoundation/zebra/blob/14c6950a20cb9c0ced7a5b9455e411add4148884/zebra-rpc/src/methods.rs#L145-L173
 
-## Produced OpenRPC Documents
+## Result Types
 
-Live OpenRPC documents generated using this library can be found at:
+Each method's result schema comes from its return type, which must implement `schemars::JsonSchema`:
 
-- Zallet: https://github.com/ZcashFoundation/zebra/blob/openrpc/zebra-rpc/zallet_openrpc_schema.json
-- Zebra: https://github.com/ZcashFoundation/zebra/blob/openrpc/zebra-rpc/zebra_openrpc_schema.json
-- Z3: https://github.com/oxarbitrage/z3/blob/openrpc-router/rpc-router/z3_merged.json
+- With `use_parent_module = false`, the `T` in a `Result<T, E>` or `RpcResult<T>` return type.
+- With `use_parent_module = true`, the `ResultType` in the method's own module.
+- For a `path::Response` return type, the `path::ResultType` beside it.
 
-## Playground
+Any other return type is a build script error.
 
-Interactive playgrounds exposing the generated OpenRPC schemas:
+## Tags
 
-- Zallet: https://playground.open-rpc.org/?uiSchema[appBar][ui:title]=Zcash&uiSchema[appBar][ui:logoUrl]=https://z.cash/wp-content/uploads/2023/03/zcash-logo.gif&schemaUrl=https://raw.githubusercontent.com/ZcashFoundation/zebra/refs/heads/openrpc/zebra-rpc/zallet_openrpc_schema.json&uiSchema[appBar][ui:splitView]=false&uiSchema[appBar][ui:edit]=false&uiSchema[appBar][ui:input]=false&uiSchema[appBar][ui:examplesDropdown]=false&uiSchema[appBar][ui:transports]=false
-- Zebra: https://playground.open-rpc.org/?uiSchema[appBar][ui:title]=Zcash&uiSchema[appBar][ui:logoUrl]=https://z.cash/wp-content/uploads/2023/03/zcash-logo.gif&schemaUrl=https://raw.githubusercontent.com/ZcashFoundation/zebra/refs/heads/openrpc/zebra-rpc/zebra_openrpc_schema.json&uiSchema[appBar][ui:splitView]=false&uiSchema[appBar][ui:edit]=false&uiSchema[appBar][ui:input]=false&uiSchema[appBar][ui:examplesDropdown]=false&uiSchema[appBar][ui:transports]=false
-- Z3: https://playground.open-rpc.org/?uiSchema[appBar][ui:title]=Zcash&uiSchema[appBar][ui:logoUrl]=https://z.cash/wp-content/uploads/2023/03/zcash-logo.gif&schemaUrl=https://raw.githubusercontent.com/oxarbitrage/z3/refs/heads/openrpc-router/rpc-router/z3_merged.json&uiSchema[appBar][ui:splitView]=false&uiSchema[appBar][ui:edit]=false&uiSchema[appBar][ui:input]=false&uiSchema[appBar][ui:examplesDropdown]=false&uiSchema[appBar][ui:transports]=false
+A `tags: a, b` line in a method's doc comment becomes the method's OpenRPC `tags`, and is left out of its description.
+
+## Viewing a Document
+
+Call `rpc.discover` on a running node and open the saved file in the [OpenRPC playground](https://playground.open-rpc.org/):
+
+```sh
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"rpc.discover","params":[],"id":1}' \
+  http://127.0.0.1:8232/ | jq .result > openrpc.json
+```
