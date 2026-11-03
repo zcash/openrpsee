@@ -48,7 +48,10 @@ impl RpcMethod {
 
 /// An OpenRPC document generator.
 pub struct Generator {
+    /// Parameters are described as they are deserialized.
     inner: SchemaGenerator,
+    /// Results are described as they are serialized, so skipped fields are optional.
+    results: SchemaGenerator,
 }
 
 impl Default for Generator {
@@ -60,12 +63,13 @@ impl Default for Generator {
 impl Generator {
     /// Creates a new OpenRPC document generator.
     pub fn new() -> Self {
+        let settings = SchemaSettings::draft07().with(|s| {
+            s.definitions_path = "#/components/schemas/".into();
+        });
+
         Self {
-            inner: SchemaSettings::draft07()
-                .with(|s| {
-                    s.definitions_path = "#/components/schemas/".into();
-                })
-                .into_generator(),
+            inner: settings.clone().for_deserialize().into_generator(),
+            results: settings.for_serialize().into_generator(),
         }
     }
 
@@ -99,7 +103,7 @@ impl Generator {
                 .unwrap_or(T::DOCS),
             description: T::DOCS,
             required: false,
-            schema: self.inner.subschema_for::<T>(),
+            schema: self.results.subschema_for::<T>(),
             deprecated: false,
         }
     }
@@ -120,16 +124,28 @@ impl Generator {
                 .unwrap_or(description),
             description,
             required: false,
-            schema: self.inner.subschema_for::<T>(),
+            schema: self.results.subschema_for::<T>(),
             deprecated: false,
         }
     }
 
     /// Consumes the generator and produces the OpenRPC components.
     pub fn into_components(mut self) -> Components {
-        Components {
-            schemas: self.inner.take_definitions(false),
+        let mut schemas = self.inner.take_definitions(false);
+        for (name, schema) in self.results.take_definitions(false) {
+            match schemas.get(&name) {
+                // A type that serializes differently from how it deserializes, used both as a
+                // parameter and in a result, has two schemas under one name. Keep the parameter's.
+                Some(existing) => debug_assert!(
+                    *existing == schema,
+                    "`{name}` has different parameter and result schemas"
+                ),
+                None => {
+                    schemas.insert(name, schema);
+                }
+            }
         }
+        Components { schemas }
     }
 }
 
@@ -210,4 +226,50 @@ pub struct Components {
 
 fn is_false(b: &bool) -> bool {
     !b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A field the type always deserializes but skips when serializing.
+    #[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct Param {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        values: Vec<u32>,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct Output {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        values: Vec<u32>,
+    }
+
+    fn required(components: &Components, name: &str) -> Vec<String> {
+        serde_json::to_value(&components.schemas[name]["required"])
+            .ok()
+            .and_then(|required| serde_json::from_value(required).ok())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn skipped_fields_are_optional_only_in_results() {
+        let mut generator = Generator::new();
+        generator.param::<Param>("param", "", true);
+        generator.result_schema::<Output>("result", "");
+        let components = generator.into_components();
+
+        assert_eq!(required(&components, "Param"), ["values"]);
+        assert!(required(&components, "Output").is_empty());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "`Param` has different parameter and result schemas")]
+    fn conflicting_schemas_fail_in_debug_builds() {
+        let mut generator = Generator::new();
+        generator.param::<Param>("param", "", true);
+        generator.result_schema::<Param>("result", "");
+        generator.into_components();
+    }
 }
