@@ -162,15 +162,18 @@ pub struct OpenRpc {
     pub components: Components,
 }
 
+// OpenRPC tools reject component names outside `[a-zA-Z0-9.-_]` and may not resolve a remote
+// `$ref`, so the document's own schema is named and described inline.
 impl JsonSchema for OpenRpc {
     fn schema_name() -> Cow<'static, str> {
-        Cow::Borrowed("OpenRPC Schema")
+        Cow::Borrowed("OpenRpcDocument")
     }
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
-        Schema::new_ref(
-            "https://raw.githubusercontent.com/open-rpc/meta-schema/master/schema.json".into(),
-        )
+        schemars::json_schema!({
+            "type": "object",
+            "description": "An OpenRPC document, as defined by https://spec.open-rpc.org/.",
+        })
     }
 }
 
@@ -261,6 +264,21 @@ mod tests {
 
         assert_eq!(required(&components, "Param"), ["values"]);
         assert!(required(&components, "Output").is_empty());
+    }
+
+    #[test]
+    fn document_schema_is_self_contained() {
+        let mut generator = Generator::new();
+        generator.result::<OpenRpc>("rpc.discover_result");
+        let components = generator.into_components();
+        let schemas = serde_json::to_string(&components.schemas).expect("serializes");
+
+        assert!(components.schemas.contains_key("OpenRpcDocument"));
+        assert!(components.schemas.keys().all(|name| {
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        }));
+        assert!(!schemas.contains("\"$ref\":\"http"), "{schemas}");
     }
 
     #[test]
