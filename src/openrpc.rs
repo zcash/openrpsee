@@ -12,10 +12,12 @@ pub type Response = RpcResult<ResultType>;
 /// The result type for an `rpc.discover` RPC request.
 pub type ResultType = OpenRpc;
 
-/// Static information about a Zallet JSON-RPC method.
+/// Static information about a JSON-RPC method.
 pub struct RpcMethod {
     /// A description of the method.
     pub description: &'static str,
+    /// The method's OpenRPC tags.
+    pub tags: &'static [&'static str],
     /// A function that generates the method's parameters.
     pub params: fn(&mut Generator) -> Vec<ContentDescriptor>,
     /// A function that generates the method's result.
@@ -39,6 +41,7 @@ impl RpcMethod {
             params: (self.params)(generator),
             result: (self.result)(generator),
             deprecated: self.deprecated,
+            tags: self.tags.iter().map(|&name| Tag { name }).collect(),
         }
     }
 }
@@ -46,6 +49,12 @@ impl RpcMethod {
 /// An OpenRPC document generator.
 pub struct Generator {
     inner: SchemaGenerator,
+}
+
+impl Default for Generator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Generator {
@@ -89,6 +98,27 @@ impl Generator {
                 .map(|(summary, _)| summary)
                 .unwrap_or(T::DOCS),
             description: T::DOCS,
+            required: false,
+            schema: self.inner.subschema_for::<T>(),
+            deprecated: false,
+        }
+    }
+
+    /// Constructs the descriptor for a JSON-RPC method's result type, with the given description.
+    ///
+    /// Unlike [`result`](Self::result), `T` doesn't need to implement `Documented`.
+    pub fn result_schema<T: JsonSchema>(
+        &mut self,
+        name: &'static str,
+        description: &'static str,
+    ) -> ContentDescriptor {
+        ContentDescriptor {
+            name,
+            summary: description
+                .split_once('\n')
+                .map(|(summary, _)| summary)
+                .unwrap_or(description),
+            description,
             required: false,
             schema: self.inner.subschema_for::<T>(),
             deprecated: false,
@@ -149,6 +179,14 @@ pub struct Method {
     result: ContentDescriptor,
     #[serde(skip_serializing_if = "is_false")]
     deprecated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<Tag>,
+}
+
+/// An OpenRPC tag for grouping methods.
+#[derive(Clone, Debug, Serialize)]
+pub struct Tag {
+    name: &'static str,
 }
 
 /// A descriptor for a JSON-RPC method's parameter or result.
